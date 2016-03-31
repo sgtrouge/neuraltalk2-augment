@@ -152,11 +152,8 @@ local function eval_split(split, evalopt)
   local loss_evals = 0
   local predictions = {}
   while true do
-    -- look at each image individually
     -- fetch a batch of data
     local data = loader:getBatch{batch_size = opt.batch_size, split = split, seq_per_img = opt.seq_per_img}
-    -- ## do duplication of original image
-    --  now to cropping of original image
     local ori_images = torch.ByteTensor(opt.batch_size, 3, 256, 256)
     ori_images = data.images
     data.images = net_utils.prepro(data.images, false, opt.gpuid >= 0) -- preprocess in place, and don't augment   
@@ -182,7 +179,7 @@ local function eval_split(split, evalopt)
 
 
     -- if augmentation flag is on then do so
-    local avg_feats = feats -- technically still pointing to same feats, but w/e
+    local avg_feats = feats -- technically still pointing to feats
     if opt.image_augment == 1 then
       local sum_array = {}
       -- init array
@@ -196,7 +193,6 @@ local function eval_split(split, evalopt)
       -- model 
       -- load the feats from original image
       add_crop(sum_array, ori_images, 1, 1.0/20, 224, 1)
-
       -- do smaller cropping here
       add_crop(sum_array, ori_images, 19, 1.0/20, 70)
 
