@@ -25,8 +25,8 @@ cmd:option('-model','','path to model to evaluate')
 cmd:option('-batch_size', 1, 'if > 0 then overrule, otherwise load from checkpoint.')
 cmd:option('-num_images', 100, 'how many images to use when periodically evaluating the loss? (-1 = all)')
 cmd:option('-language_eval', 0, 'Evaluate language as well (1 = yes, 0 = no)? BLEU/CIDEr/METEOR/ROUGE_L? requires coco-caption code from Github.')
-cmd:option('-dump_images', 1, 'Dump images into vis/imgs folder for vis? (1=yes,0=no)')
-cmd:option('-dump_json', 1, 'Dump json with predictions into vis folder? (1=yes,0=no)')
+cmd:option('-dump_images', 0, 'Dump images into vis/imgs folder for vis? (1=yes,0=no)')
+cmd:option('-dump_json', 0, 'Dump json with predictions into vis folder? (1=yes,0=no)')
 cmd:option('-dump_path', 0, 'Write image paths along with predictions into vis json? (1=yes,0=no)')
 -- Sampling options
 cmd:option('-sample_max', 1, '1 = sample argmax words. 0 = sample from distributions.')
@@ -34,6 +34,8 @@ cmd:option('-beam_size', 2, 'used when sample_max = 1, indicates number of beams
 cmd:option('-temperature', 1.0, 'temperature when sampling from distributions (i.e. when sample_max = 0). Lower = "safer" predictions.')
 -- For evaluation on a folder of images:
 cmd:option('-image_folder', '', 'If this is nonempty then will predict on the images in this folder path')
+cmd:option('-image_augment', 0, 'If this is 1 then will eval images by augmentation')
+cmd:option('-aug_size', 0, 'Number of augmentation per image (cropping atm)')
 cmd:option('-image_root', '', 'In case the image paths have to be preprended with a root path to an image folder')
 -- For evaluation on MSCOCO images from some split:
 cmd:option('-input_h5','','path to the h5file containing the preprocessed dataset. empty = fetch from model checkpoint.')
@@ -96,6 +98,45 @@ protos.crit = nn.LanguageModelCriterion()
 protos.lm:createClones() -- reconstruct clones inside the language model
 if opt.gpuid >= 0 then for k,v in pairs(protos) do v:cuda() end end
 
+
+-------------------------------------------------------------------------------
+local function add_crop(sum_array, ori_images, iter, weight, crop_size, center)
+  local crop_images = torch.ByteTensor(ori_images:size(1), 3, 224, 224)
+  for i = 1,iter do
+    -- specifiy scale of crop
+    local cnn_input_size = 224 
+    -- choose coordinate to crop
+    local h,w = ori_images:size(3), ori_images:size(4)
+  
+    if center == 1 then
+      xoff, yoff = math.ceil((w-cnn_input_size)/2), math.ceil((h-cnn_input_size)/2)
+    else
+      xoff, yoff = torch.random(w-crop_size), torch.random(h-crop_size)
+    end
+    for i=1,opt.batch_size do
+      crop_images[i] = image.scale(ori_images[i][{{}, {yoff,yoff+crop_size-1}, {xoff,xoff+crop_size-1}}], cnn_input_size, cnn_input_size)
+    end
+
+    -- convert/extra preprocess before feeding
+    if on_gpu then crop_images = crop_images:cuda() else crop_images = crop_images:float() end
+
+    -- lazily instantiate vgg_mean
+    if not net_utils.vgg_mean then
+      net_utils.vgg_mean = torch.FloatTensor{123.68, 116.779, 103.939}:view(1,3,1,1) -- in RGB order
+    end
+    net_utils.vgg_mean = net_utils.vgg_mean:typeAs(crop_images) -- a noop if the types match
+    -- subtract vgg mean
+    crop_images:add(-1, net_utils.vgg_mean:expandAs(crop_images))
+    
+    -- adding weight to sum
+    local crop_feats = protos.cnn:forward(crop_images)
+    for i=1,opt.batch_size do
+      for j=1,crop_feats:size(2) do
+        sum_array[i][j] = sum_array[i][j] + crop_feats[i][j]*weight
+      end
+    end        
+  end
+end
 -------------------------------------------------------------------------------
 -- Evaluation fun(ction)
 -------------------------------------------------------------------------------
@@ -111,15 +152,19 @@ local function eval_split(split, evalopt)
   local loss_evals = 0
   local predictions = {}
   while true do
-
+    -- look at each image individually
     -- fetch a batch of data
     local data = loader:getBatch{batch_size = opt.batch_size, split = split, seq_per_img = opt.seq_per_img}
-    data.images = net_utils.prepro(data.images, false, opt.gpuid >= 0) -- preprocess in place, and don't augment
+    -- ## do duplication of original image
+    --  now to cropping of original image
+    local ori_images = torch.ByteTensor(opt.batch_size, 3, 256, 256)
+    ori_images = data.images
+    data.images = net_utils.prepro(data.images, false, opt.gpuid >= 0) -- preprocess in place, and don't augment   
+
     n = n + data.images:size(1)
 
     -- forward the model to get loss
     local feats = protos.cnn:forward(data.images)
-
     -- evaluate loss if we have the labels
     local loss = 0
     if data.labels then
@@ -134,8 +179,39 @@ local function eval_split(split, evalopt)
     local sample_opts = { sample_max = opt.sample_max, beam_size = opt.beam_size, temperature = opt.temperature }
     local seq = protos.lm:sample(feats, sample_opts)
     local sents = net_utils.decode_sequence(vocab, seq)
+
+
+    -- if augmentation flag is on then do so
+    local avg_feats = feats -- technically still pointing to same feats, but w/e
+    if opt.image_augment == 1 then
+      local sum_array = {}
+      -- init array
+      for i =1,opt.batch_size do
+        sum_array[i] = {}
+        for j = 1,feats:size(2) do
+          sum_array[i][j] = 0
+        end
+      end
+
+      -- model 
+      -- load the feats from original image
+      add_crop(sum_array, ori_images, 1, 1.0/20, 224, 1)
+
+      -- do smaller cropping here
+      add_crop(sum_array, ori_images, 19, 1.0/20, 70)
+
+      for i =1,opt.batch_size do
+        for j = 1,avg_feats:size(2) do
+          avg_feats[i][j] = sum_array[i][j]
+        end
+      end
+    end
+    
+    local avg_seq = protos.lm:sample(avg_feats, sample_opts)
+    local avg_sents = net_utils.decode_sequence(vocab, avg_seq)
+
     for k=1,#sents do
-      local entry = {image_id = data.infos[k].id, caption = sents[k]}
+      local entry = {image_id = data.infos[k].id, caption = avg_sents[k], base_caption = sents[k]}
       if opt.dump_path == 1 then
         entry.file_name = data.infos[k].file_path
       end
@@ -147,7 +223,7 @@ local function eval_split(split, evalopt)
         os.execute(cmd) -- dont think there is cleaner way in Lua
       end
       if verbose then
-        print(string.format('image %s: %s', entry.image_id, entry.caption))
+        print(string.format('image %s: %s\nbase caption: %s\n', entry.image_id, entry.caption, entry.base_caption))
       end
     end
 
@@ -171,7 +247,7 @@ local function eval_split(split, evalopt)
 end
 
 local loss, split_predictions, lang_stats = eval_split(opt.split, {num_images = opt.num_images})
-print('loss: ', loss)
+-- print('loss: ', loss)
 if lang_stats then
   print(lang_stats)
 end
