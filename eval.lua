@@ -192,9 +192,9 @@ local function eval_split(split, evalopt)
 
       -- model 
       -- load the feats from original image
-      add_crop(sum_array, ori_images, 1, 1.0/20, 224, 1)
-      -- do smaller cropping here
-      add_crop(sum_array, ori_images, 19, 1.0/20, 70)
+add_crop(sum_array, ori_images, 3, 0.2/3, 224)
+add_crop(sum_array, ori_images, 6, 0.3/6, 170)
+add_crop(sum_array, ori_images, 9, 0.5/9, 120)
 
       for i =1,opt.batch_size do
         for j = 1,avg_feats:size(2) do
@@ -219,7 +219,7 @@ local function eval_split(split, evalopt)
         os.execute(cmd) -- dont think there is cleaner way in Lua
       end
       if verbose then
-        print(string.format('image %s: %s\nbase caption: %s\n', entry.image_id, entry.caption, entry.base_caption))
+        print(string.format('image %s: \nour caption: %s\nbase caption: %s\n', data.infos[k].file_path, entry.caption, entry.base_caption))
       end
     end
 
