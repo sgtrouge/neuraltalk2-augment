@@ -4,3 +4,6 @@ In this modified version of Karpathy's work, I am trying to see whether random c
 
 # TODO
 Find a good weighting scheme for cropping. I am trying to simulate how human mind work when they see an image, which region will they look at and how does the semantic information from that region affect the thinking process. 
+
+option: 
+figure out the output scheme of VGG net, then reweight the "counting" feature aptly (if we crop large image, then "number" informtation from it should weight larger than smaller image feature)
