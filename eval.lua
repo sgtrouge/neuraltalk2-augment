@@ -1,6 +1,7 @@
 require 'torch'
 require 'nn'
 require 'nngraph'
+require 'unsup'
 -- exotics
 require 'loadcaffe'
 -- local imports
@@ -98,10 +99,47 @@ protos.crit = nn.LanguageModelCriterion()
 protos.lm:createClones() -- reconstruct clones inside the language model
 if opt.gpuid >= 0 then for k,v in pairs(protos) do v:cuda() end end
 
+--------- 
+local function findPCA(ori_images)
+  local agg_matrix = torch.reshape(ori_images[1][{{},{1}, {1}}], 1, 3)
+  local max_m = 0
+  for i = 1, ori_images:size(1) do
+    for rx = 1, 224 do
+      for ry = 1, 224 do
+        if i*rx*ry > 1 then
+          agg_matrix = torch.cat(agg_matrix, torch.reshape(ori_images[i][{{},{rx}, {ry}}], 1, 3) ,1)
+        end
+      end
+    end
+  end
+  local ce, cv = unsup.pcacov(agg_matrix[{{},{}}]:double())
+  return ce, cv
+end
 
+local function RGBnoise(float_images, eigenvalues, eigenvectors)
+  local num_images = float_images:size(1)
+  local res_images = torch.DoubleTensor(num_images, 3, 224, 224)
+  for i = 1, num_images do
+    local tmp = torch.DoubleTensor(3,1)
+    tmp[1] = eigenvalues[1] * torch.normal(0, 0.1)
+    tmp[2] = eigenvalues[2] * torch.normal(0, 0.1)
+    tmp[3] = eigenvalues[3] * torch.normal(0, 0.1)
+    tmp = eigenvectors*tmp
+    for channel = 1, 3 do
+      for rx = 1, 224 do
+        for ry = 1, 224 do
+          res_images[i][channel][rx][ry] = float_images[i][channel][rx][ry] + tmp[channel][1]
+        end
+      end
+    end
+  end
+  return res_images:float()
+end
 -------------------------------------------------------------------------------
-local function add_crop(sum_array, ori_images, iter, weight, crop_size, center)
+local function add_crop(sum_array, ori_images, iter, weight, crop_size, drop_out_chance, noise_on, ce, cv, mean_filter_on, center)
   local crop_images = torch.ByteTensor(ori_images:size(1), 3, 224, 224)
+  print(drop_out_chance)
+  print(noise_on)
   for i = 1,iter do
     -- specifiy scale of crop
     local cnn_input_size = 224 
@@ -127,16 +165,40 @@ local function add_crop(sum_array, ori_images, iter, weight, crop_size, center)
     net_utils.vgg_mean = net_utils.vgg_mean:typeAs(crop_images) -- a noop if the types match
     -- subtract vgg mean
     crop_images:add(-1, net_utils.vgg_mean:expandAs(crop_images))
-    
+    if noise_on == true then   
+      crop_images = RGBnoise(crop_images, ce, cv)
+    end
     -- adding weight to sum
     local crop_feats = protos.cnn:forward(crop_images)
+    local feat_size = crop_feats:size(2)
     for i=1,opt.batch_size do
-      for j=1,crop_feats:size(2) do
-        sum_array[i][j] = sum_array[i][j] + crop_feats[i][j]*weight
+      local max_feat = 0
+      local sum_feat = 0
+      for j=1,feat_size do
+        max_feat = math.max(max_feat, crop_feats[i][j])
+        sum_feat = sum_feat + crop_feats[i][j]
+      end
+      for j=1,feat_size do
+        local p = 1
+        --normalize by dropout rate
+        if (drop_out_chance >= 0) then
+          p = crop_feats[i][j]/max_feat*drop_out_chance
+          p = torch.bernoulli(p)
+        end
+
+        --mean filter
+        if (mean_filter_on == true) then
+          if (crop_feats[i][j] < sum_feat/feat_size) then
+            p = 0
+          end
+        end
+        sum_array[i][j] = sum_array[i][j] + crop_feats[i][j]*weight*p
       end
     end        
   end
 end
+
+
 -------------------------------------------------------------------------------
 -- Evaluation fun(ction)
 -------------------------------------------------------------------------------
@@ -156,6 +218,7 @@ local function eval_split(split, evalopt)
     local data = loader:getBatch{batch_size = opt.batch_size, split = split, seq_per_img = opt.seq_per_img}
     local ori_images = torch.ByteTensor(opt.batch_size, 3, 256, 256)
     ori_images = data.images
+    local ce, cv = findPCA(ori_images)
     data.images = net_utils.prepro(data.images, false, opt.gpuid >= 0) -- preprocess in place, and don't augment   
 
     n = n + data.images:size(1)
@@ -192,9 +255,18 @@ local function eval_split(split, evalopt)
 
       -- model 
       -- load the feats from original image
-add_crop(sum_array, ori_images, 3, 0.2/3, 224)
-add_crop(sum_array, ori_images, 6, 0.3/6, 170)
-add_crop(sum_array, ori_images, 9, 0.5/9, 120)
+      add_crop(
+        sum_array, 
+        ori_images, 
+        3,    -- num crops
+        1/3,  -- weight per crop
+        224,  -- crop size
+        -1,    -- drop_out prob, -1 if disable drop out 
+        false, -- use noise 
+        ce,   -- eigenvalues of ori
+        cv,   -- eigenvectors
+        false,-- use mean filter
+        0)    -- crop at center
 
       for i =1,opt.batch_size do
         for j = 1,avg_feats:size(2) do
