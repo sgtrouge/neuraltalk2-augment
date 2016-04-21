@@ -254,8 +254,8 @@ local function eval_split(split, evalopt)
 
       -- model 
       -- load the feats from original image
-      add_crop(sum_array, ori_images, 1, 0.15, 224,-1,false, nil, nil, false)
-      add_crop(sum_array, ori_images, 18, 0.85/18, 224,-1,false, nil, nil, false)
+      add_crop(sum_array, ori_images, 1, 0.01, 224,-1,false, nil, nil, false)
+      add_crop(sum_array, ori_images, 18, 0.99/18, 224,-1,false, nil, nil, false)
 
 
       for i =1,opt.batch_size do
