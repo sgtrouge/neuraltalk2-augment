@@ -138,8 +138,6 @@ end
 -------------------------------------------------------------------------------
 local function add_crop(sum_array, ori_images, iter, weight, crop_size, drop_out_chance, noise_on, ce, cv, mean_filter_on, center)
   local crop_images = torch.ByteTensor(ori_images:size(1), 3, 224, 224)
-  print(drop_out_chance)
-  print(noise_on)
   for i = 1,iter do
     -- specifiy scale of crop
     local cnn_input_size = 224 
@@ -178,11 +176,12 @@ local function add_crop(sum_array, ori_images, iter, weight, crop_size, drop_out
         max_feat = math.max(max_feat, crop_feats[i][j])
         sum_feat = sum_feat + crop_feats[i][j]
       end
+        mean_feat = sum_feat/feat_size
       for j=1,feat_size do
         local p = 1
         --normalize by dropout rate
         if (drop_out_chance >= 0) then
-          p = crop_feats[i][j]/max_feat*drop_out_chance
+          p = math.min(1, crop_feats[i][j]/mean_feat*drop_out_chance)
           p = torch.bernoulli(p)
         end
 
@@ -255,18 +254,9 @@ local function eval_split(split, evalopt)
 
       -- model 
       -- load the feats from original image
-      add_crop(
-        sum_array, 
-        ori_images, 
-        3,    -- num crops
-        1/3,  -- weight per crop
-        224,  -- crop size
-        -1,    -- drop_out prob, -1 if disable drop out 
-        false, -- use noise 
-        ce,   -- eigenvalues of ori
-        cv,   -- eigenvectors
-        false,-- use mean filter
-        0)    -- crop at center
+      add_crop(sum_array, ori_images, 1, 0.15, 224,-1,false, nil, nil, false)
+      add_crop(sum_array, ori_images, 18, 0.85/18, 224,-1,false, nil, nil, false)
+
 
       for i =1,opt.batch_size do
         for j = 1,avg_feats:size(2) do
