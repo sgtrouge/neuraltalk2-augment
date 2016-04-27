@@ -24,6 +24,15 @@ cmd:text('Options')
 cmd:option('-model','','path to model to evaluate')
 -- Basic options
 cmd:option('-batch_size', 1, 'if > 0 then overrule, otherwise load from checkpoint.')
+cmd:option('-crop_midsize', 200, 'size of crop augment')
+cmd:option('-crop_smallsize', 150, 'size of crop augment')
+
+cmd:option('-iterx', -1, 'size of crop augment')
+cmd:option('-itery', -1, 'size of crop augment')
+cmd:option('-ori_weight', 1, 'weight for original image')
+cmd:option('-mid_weight', 1, 'weight for original image')
+cmd:option('-small_weight', 1, 'weight for original image')
+
 cmd:option('-num_images', 100, 'how many images to use when periodically evaluating the loss? (-1 = all)')
 cmd:option('-language_eval', 0, 'Evaluate language as well (1 = yes, 0 = no)? BLEU/CIDEr/METEOR/ROUGE_L? requires coco-caption code from Github.')
 cmd:option('-dump_images', 0, 'Dump images into vis/imgs folder for vis? (1=yes,0=no)')
@@ -121,10 +130,9 @@ local function RGBnoise(float_images, eigenvalues, eigenvectors)
   local res_images = torch.DoubleTensor(num_images, 3, 224, 224)
   for i = 1, num_images do
     local tmp = torch.DoubleTensor(3,1)
-    tmp[1] = eigenvalues[1] * torch.normal(0, 0.1)
-    tmp[2] = eigenvalues[2] * torch.normal(0, 0.1)
-    tmp[3] = eigenvalues[3] * torch.normal(0, 0.1)
-    tmp = eigenvectors*tmp
+    tmp[1] = torch.normal(0, 0.1)
+    tmp[2] = torch.normal(0, 0.1)
+    tmp[3] = torch.normal(0, 0.1)
     for channel = 1, 3 do
       for rx = 1, 224 do
         for ry = 1, 224 do
@@ -136,20 +144,19 @@ local function RGBnoise(float_images, eigenvalues, eigenvectors)
   return res_images:float()
 end
 -------------------------------------------------------------------------------
-local function add_crop(sum_array, ori_images, iter, weight, crop_size, drop_out_chance, noise_on, ce, cv, mean_filter_on, center)
+local function add_crop(sum_array, ori_images, iter, weight, crop_size, drop_out_chance, noise_on, ce, cv, mean_filter_on, center, xoff, yoff)
   local crop_images = torch.ByteTensor(ori_images:size(1), 3, 224, 224)
-  print(drop_out_chance)
-  print(noise_on)
   for i = 1,iter do
     -- specifiy scale of crop
     local cnn_input_size = 224 
     -- choose coordinate to crop
     local h,w = ori_images:size(3), ori_images:size(4)
-  
-    if center == 1 then
-      xoff, yoff = math.ceil((w-cnn_input_size)/2), math.ceil((h-cnn_input_size)/2)
-    else
-      xoff, yoff = torch.random(w-crop_size), torch.random(h-crop_size)
+    if (xoff == nil or xoff < 0) then
+      if center == 1 then
+        xoff, yoff = math.ceil((w-cnn_input_size)/2), math.ceil((h-cnn_input_size)/2)
+      else
+        xoff, yoff = torch.random(w-crop_size), torch.random(h-crop_size)
+      end
     end
     for i=1,opt.batch_size do
       crop_images[i] = image.scale(ori_images[i][{{}, {yoff,yoff+crop_size-1}, {xoff,xoff+crop_size-1}}], cnn_input_size, cnn_input_size)
@@ -178,11 +185,12 @@ local function add_crop(sum_array, ori_images, iter, weight, crop_size, drop_out
         max_feat = math.max(max_feat, crop_feats[i][j])
         sum_feat = sum_feat + crop_feats[i][j]
       end
+        mean_feat = sum_feat/feat_size
       for j=1,feat_size do
         local p = 1
         --normalize by dropout rate
         if (drop_out_chance >= 0) then
-          p = crop_feats[i][j]/max_feat*drop_out_chance
+          p = math.min(1, crop_feats[i][j]/mean_feat*drop_out_chance)
           p = torch.bernoulli(p)
         end
 
@@ -255,18 +263,29 @@ local function eval_split(split, evalopt)
 
       -- model 
       -- load the feats from original image
-      add_crop(
-        sum_array, 
-        ori_images, 
-        3,    -- num crops
-        1/3,  -- weight per crop
-        224,  -- crop size
-        -1,    -- drop_out prob, -1 if disable drop out 
-        false, -- use noise 
-        ce,   -- eigenvalues of ori
-        cv,   -- eigenvectors
-        false,-- use mean filter
-        0)    -- crop at center
+      -- instead of random, let's do stride crop
+      add_crop(sum_array, ori_images, 1, opt.ori_weight, 224,-1,false, nil, nil, false,1)
+      
+      local tmpx = opt.iterx/math.abs(opt.iterx)
+      local numcrops = opt.iterx*opt.itery/2
+      for ix =1, math.abs(opt.iterx) do
+        local tmpy = opt.itery/math.abs(opt.itery)
+        for iy =1, math.abs(opt.itery/2) do
+          add_crop(sum_array, ori_images,1, (opt.mid_weight)/numcrops, opt.crop_midsize,-1,false, nil, nil, false,0, tmpx, tmpy)
+          tmpy = tmpy + torch.floor((256-opt.crop_midsize)/opt.itery)*2
+        end
+        tmpx = tmpx + torch.floor((256-opt.crop_midsize)/opt.iterx)
+      end
+
+      local tmpx = opt.iterx/math.abs(opt.iterx)
+      for ix =1, math.abs(opt.iterx) do
+        local tmpy = opt.itery/math.abs(opt.itery)
+        for iy =1, math.abs(opt.itery/2) do
+          add_crop(sum_array, ori_images,1, (opt.small_weight)/numcrops, opt.crop_smallsize,-1,false, nil, nil, false,0, tmpx, tmpy)
+          tmpy = tmpy + torch.floor((256-opt.crop_smallsize)/opt.itery)*2
+        end
+        tmpx = tmpx + torch.floor((256-opt.crop_smallsize)/opt.iterx)
+      end
 
       for i =1,opt.batch_size do
         for j = 1,avg_feats:size(2) do
